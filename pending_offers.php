@@ -1,0 +1,190 @@
+<?php
+session_start();
+
+// Prevent caching
+header("Cache-Control: no-store, no-cache, must-revalidate, max-age=0");
+header("Pragma: no-cache");
+
+include 'db.php';
+include 'assets/icons.php';
+
+// Handle language selection
+$allowed_langs = ['eng','hin','telugu'];
+if(isset($_POST['lang']) && in_array($_POST['lang'],$allowed_langs)){
+    $_SESSION['lang'] = $_POST['lang'];
+}
+
+// Default language
+$lang = $_SESSION['lang'] ?? 'eng';
+$translations = include "lang/$lang.php";
+
+function t($key, $params=[]){
+    global $translations;
+    $str = $translations[$key] ?? $key;
+    if(!empty($params)) $str = vsprintf($str, $params);
+    return $str;
+}
+
+// Check login
+if(!isset($_SESSION['user_id'])){
+    header("Location: login.php");
+    exit;
+}
+
+$user_id = $_SESSION['user_id'];
+
+// Handle accept/reject POST
+if($_SERVER['REQUEST_METHOD']==='POST' && isset($_POST['negotiation_id'], $_POST['response'])){
+    $negotiation_id = intval($_POST['negotiation_id']);
+    $response = $_POST['response']; // accepted / rejected
+
+    // Update negotiation status
+    $stmt = $conn->prepare("UPDATE negotiations SET status=? WHERE id=?");
+    $stmt->bind_param("si",$response,$negotiation_id);
+    $stmt->execute();
+
+    if($response==='accepted'){
+        // Complete listing
+        $stmt2 = $conn->prepare("
+            UPDATE marketplace 
+            SET status='completed', buyer_id=(SELECT buyer_id FROM negotiations WHERE id=?)
+            WHERE id=(SELECT listing_id FROM negotiations WHERE id=?)
+        ");
+        $stmt2->bind_param("ii",$negotiation_id,$negotiation_id);
+        $stmt2->execute();
+
+        // Handle balance & credits transfer
+        $stmt3 = $conn->prepare("
+            SELECT n.buyer_id, m.seller_id, n.offer_price, n.offer_credits
+            FROM negotiations n
+            JOIN marketplace m ON n.listing_id = m.id
+            WHERE n.id=? LIMIT 1
+        ");
+        $stmt3->bind_param("i",$negotiation_id);
+        $stmt3->execute();
+        $stmt3->bind_result($buyer_id,$seller_id,$offer_price,$offer_credits);
+        $stmt3->fetch();
+        $stmt3->close();
+
+        if($buyer_id && $seller_id && $offer_price>0){
+            // Check buyer balance
+            $stmt4 = $conn->prepare("SELECT balance, credits FROM users WHERE id=?");
+            $stmt4->bind_param("i",$buyer_id);
+            $stmt4->execute();
+            $stmt4->bind_result($buyer_balance,$buyer_credits);
+            $stmt4->fetch();
+            $stmt4->close();
+
+            if($buyer_balance >= $offer_price){
+                // Deduct balance & add credits for buyer
+                $stmt5 = $conn->prepare("UPDATE users SET balance = balance - ?, credits = credits + ? WHERE id=?");
+                $stmt5->bind_param("dii",$offer_price,$offer_credits,$buyer_id);
+                $stmt5->execute();
+
+                // Credit balance & deduct credits for seller
+                $stmt6 = $conn->prepare("UPDATE users SET balance = balance + ?, credits = credits - ? WHERE id=?");
+                $stmt6->bind_param("dii",$offer_price,$offer_credits,$seller_id);
+                $stmt6->execute();
+
+                // Insert transaction
+                $stmt7 = $conn->prepare("INSERT INTO transactions (buyer_id, seller_id, credits, price, created_at) VALUES (?,?,?,?, NOW())");
+                $stmt7->bind_param("iiid",$buyer_id,$seller_id,$offer_credits,$offer_price);
+                $stmt7->execute();
+            }else{
+                $_SESSION['msg'] = t("insufficient_balance");
+                header("Location: pending_offers.php");
+                exit;
+            }
+        }
+    }
+
+    $_SESSION['msg'] = t("offer_response_msg",[$response]);
+    header("Location: pending_offers.php");
+    exit;
+}
+
+// Fetch pending offers for listings owned by this user
+$offers = $conn->query("
+    SELECT n.*, u.name AS buyer_name, m.type, m.credits AS listing_credits, m.price AS listing_price
+    FROM negotiations n
+    JOIN users u ON n.buyer_id = u.id
+    JOIN marketplace m ON n.listing_id = m.id
+    WHERE m.seller_id = $user_id AND n.status='pending'
+    ORDER BY n.created_at DESC
+");
+
+$msg = $_SESSION['msg'] ?? '';
+unset($_SESSION['msg']);
+?>
+
+<!DOCTYPE html>
+<html lang="<?= $lang ?>">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title><?= t("pending_offers") ?></title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/theme.css">
+</head>
+<body>
+
+<div class="container fade-in">
+<div class="lang-select">
+<form method="POST">
+<select name="lang" class="lang-input" onchange="this.form.submit()">
+    <option value="eng" <?= ($lang=='eng')?'selected':'' ?>>English</option>
+    <option value="hin" <?= ($lang=='hin')?'selected':'' ?>>हिंदी</option>
+    <option value="telugu" <?= ($lang=='telugu')?'selected':'' ?>>తెలుగు</option>
+</select>
+</form>
+</div>
+
+<h2><?= icon('offers') ?> <?= t("pending_offers") ?></h2>
+
+<?php if($msg): ?>
+<div class="alert alert-success"><?= icon('check') ?><span><?= htmlspecialchars($msg) ?></span></div>
+<?php endif; ?>
+
+<div class="card">
+<?php if($offers->num_rows>0): ?>
+<div class="table-wrap">
+<table class="styled-table">
+<tr>
+    <th><?= t("buyer") ?></th>
+    <th><?= t("listing_type") ?></th>
+    <th><?= t("listing_credits") ?></th>
+    <th><?= t("listing_price") ?></th>
+    <th><?= t("offer_credits") ?></th>
+    <th><?= t("offer_price") ?></th>
+    <th><?= t("action") ?></th>
+</tr>
+<?php while($offer=$offers->fetch_assoc()): ?>
+<tr>
+<td><?= htmlspecialchars($offer['buyer_name']); ?></td>
+<td><span class="badge badge-neutral"><?= ucfirst($offer['type']); ?></span></td>
+<td><?= $offer['listing_credits']; ?></td>
+<td><?= $offer['listing_price']; ?></td>
+<td><?= $offer['offer_credits']; ?></td>
+<td><?= $offer['offer_price']; ?></td>
+<td>
+<form method="POST" class="inline-form">
+    <input type="hidden" name="negotiation_id" value="<?= $offer['id'] ?>">
+    <button class="btn btn-primary btn-sm" name="response" value="accepted"><?= icon('check') ?><?= t("accept") ?></button>
+    <button class="btn btn-danger btn-sm" name="response" value="rejected"><?= icon('close') ?><?= t("reject") ?></button>
+</form>
+</td>
+</tr>
+<?php endwhile; ?>
+</table>
+</div>
+<?php else: ?>
+<div class="empty-state"><?= icon('offers') ?><p><?= t("no_offers") ?></p></div>
+<?php endif; ?>
+</div>
+
+<a class="back-link" href="community_dashboard.php"><?= icon('back') ?><?= t("back") ?></a>
+</div>
+
+</body>
+</html>
